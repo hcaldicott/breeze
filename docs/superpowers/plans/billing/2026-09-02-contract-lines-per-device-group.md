@@ -8,17 +8,23 @@ tracking_issue: LanternOps/breeze#3205
 
 **Goal:** Add a `per_device_group` contract line type that bills the members of a device group, evaluating dynamic groups live at estimate and invoice time so a stale materialized membership can never be invoiced, and refusing to delete a group that a running contract bills.
 
-**Architecture:** One new enum value and two columns on `contract_lines` (`device_group_id`, stamped `device_group_name`), guarded by a CHECK and two deferrable composite FKs. Membership comes from one read-only resolver in `groupMembership.ts` that the existing evaluator also uses. The wave 1 device snapshot becomes per-device so group membership, role and site compose in the pure helpers of `contractCoverage.ts`. All three group-delete surfaces call one transactional service that refuses while a draft/active/paused contract bills the group. Aggregate reads (list, MRR) degrade per contract instead of failing whole.
+**Architecture:** One new enum value and two columns on `contract_lines` (`device_group_id`, stamped `device_group_name`), guarded by a CHECK and two deferrable composite FKs. Membership comes from one read-only resolver in `groupMembership.ts` that the existing evaluator also uses. The #4585 device snapshot becomes per-device so group membership, role and site compose in the pure helpers of `contractCoverage.ts`. All three group-delete surfaces call one transactional service that refuses while a draft/active/paused contract bills the group. Aggregate reads (list, MRR) degrade per contract instead of failing whole.
 
 **Tech Stack:** Postgres 16, Drizzle ORM, Hono, Zod 4 (`z.string().guid()`), Vitest (unit + `vitest.integration.config.ts` real-DB suites), React + react-i18next (8 locales), Astro.
 
 **Spec:** `docs/superpowers/specs/billing/2026-09-02-contract-lines-per-device-group-design.md`
 
-**Wave:** #3205 W02 (wave sub-issue #4648; feature request #4584). Branch from `main` after PR #4585 (wave 1) merges: `feature/3205-device-groups/wave-4648`.
+**Tracking:** feature #3205, wave sub-issue #4648, feature request #4584. Wave 1
+of feature #3205 (`per_device_role`) shipped as PR #4585 — this plan assumes it is
+on `main`
+(`services/contractCoverage.ts`, `snapshotContractDevices`, the `device_roles`
+column and its CHECK all exist). **This plan ships in four PRs, not one — see
+[Waves](#waves) below for branch names, order and the ship-alone argument for
+each.**
 
 ## Global Constraints
 
-- Migrations must sort after the newest committed file. Re-run `ls apps/api/migrations | grep -E '^[0-9]{4}-' | sort | tail -1` before creating them; wave 1's `2026-10-05-100100-contract-lines-device-roles.sql` is the floor once #4585 merges. Use `2026-10-06-100000-…` and `2026-10-06-100100-…` unless something newer landed; then bump the date past it and keep the `-100000-` / `-100100-` time components.
+- Migrations must sort after the newest committed file. Re-run `ls apps/api/migrations | grep -E '^[0-9]{4}-' | sort | tail -1` before creating them; as of writing the floor is `2026-10-05-100200-patch-reboot-deferral-settings.sql` (#4585 has merged), so `2026-10-06-100000-…` and `2026-10-06-100100-…` still sort last. If something newer landed, bump the date past it and keep the `-100000-` / `-100100-` time components.
 - The enum value and any statement that references it must be in separate migration files (`autoMigrate` wraps each file in one transaction; Postgres refuses to use an enum value added in the same transaction).
 - Migrations are idempotent (`IF NOT EXISTS`, `DROP CONSTRAINT IF EXISTS` then re-add), no inner `BEGIN;`/`COMMIT;`.
 - **Every composite FK that references an `org_id` column is `DEFERRABLE INITIALLY IMMEDIATE`** (`orgLifecycleFoundations.integration.test.ts` merge contract).
@@ -29,10 +35,263 @@ tracking_issue: LanternOps/breeze#3205
 - Group lines carry no `site_id` (Zod and CHECK). The group's own `site_id` narrows billing to that site.
 - Group deletion goes through `deleteDeviceGroup` on all three surfaces (`routes/groups.ts`, `routes/devices/groups.ts`, `aiToolsFleet.ts`).
 - Run one test file with `cd apps/api && npx vitest run <path>` (never `pnpm --filter … test -- --run`). Integration suites: `cd apps/api && npx vitest run --config vitest.integration.config.ts <path>` with `DATABASE_URL` set to the test stack (`worktree-stack` skill, or `docker compose -f docker-compose.test.yml up -d` per `apps/api/vitest.integration.config.ts`).
+- Every wave branches off `main` and merges before the next branches. **Never stack a wave on a sibling wave branch** — `ci.yml` triggers on `pull_request: branches: [main]`, so a stacked PR runs no CI and reads green.
+- No new tables: the only registration list a column addition fires is `CORE_TENANT_EXPORT_POLICY`. All other cascade/merge lists already carry `contract_lines` and `device_groups` — see [Tenancy, RLS and registration lists](#tenancy-rls-and-registration-lists) before writing the migration.
+- Red first: write the failing test, run it, watch it fail, then implement. Commit after every task.
+
+---
+
+## Waves
+
+This plan ships in **four independently shippable waves**. Each wave is one PR
+branched **off `main`** and merged before the next branches. A wave leaves the
+repo green (tsc, lint, unit, and the integration suites it touches) and leaves
+the product coherent on its own — no wave needs a later wave to be *correct*,
+only to be *complete*.
+
+> **Naming:** `W01`/`W02` are feature #3205's *lifecycle* waves — W01 is PR #4585
+> (`per_device_role`), W02 is this entire plan. `A`–`D` below are this plan's
+> internal shipping waves, all under W02 / sub-issue #4648. Elsewhere in this
+> document, references to shipped `per_device_role` work say "#4585".
+
+**Never stack these branches.** `ci.yml` triggers on `pull_request: branches:
+[main]`, so a PR whose base is a sibling wave branch runs **no CI at all** —
+only the two `smoke-binary-source-*` workflows, which makes `gh pr checks` read
+green on code that was never tested. See [CI traps](#ci-traps-and-how-this-plan-avoids-them).
+
+| Wave | Tasks | Branch | Depends on | Ships |
+|---|---|---|---|---|
+| **A — live membership resolver** | 3 | `feature/3205-device-groups/wave-a-resolver` | — | `resolveEffectiveGroupMembers`, `GroupForResolution`, `GroupEvaluationError`; `evaluateGroupMembership` refactored to consume them |
+| **B — schema, line type, billing** | 1, 2, 4, 5, 7, 8 | `feature/3205-device-groups/wave-b-billing` | A | enum value, columns, CHECK, deferrable composite FKs, export policy, per-device snapshot, quantities, estimate, generation, quote-to-contract, AI tool, export round-trip |
+| **C — group-delete guard** | 6, and the `DeviceGroupsPage.tsx` half of Task 10 | `feature/3205-device-groups/wave-c-delete-guard` | B | one transactional `deleteDeviceGroup` behind all three surfaces, 409 + web modal |
+| **D — contracts web UI + docs** | 9, the `ContractDetail`/`ContractsList` half of Task 10, 11 | `feature/3205-device-groups/wave-d-web` | B | editor group select, detail/list rendering, i18n across 8 locales, docs |
+
+**C and D are order-independent** once B has merged; both branch off `main`
+after B and may run in parallel in two worktrees. **A → B is strictly
+sequential.**
+
+### Why each wave stands alone
+
+- **A** is a behaviour-preserving extraction plus new read-only exports. The
+  existing suites (`dynamicGroupMembershipMaterialization.integration.test.ts`,
+  `groupDeleteMembershipLog.integration.test.ts`) are the regression proof that
+  the evaluator still writes exactly the same membership rows; the new
+  `groupMembership.resolve.integration.test.ts` covers the resolver directly.
+  For one merge the new exports have a single consumer (their own test). That is
+  the seam, not dead code — and it is what lets wave B's much larger diff be
+  reviewed without also re-reviewing the membership engine.
+- **B is atomic and must not be split further.** Task 1 (shared
+  `CONTRACT_LINE_TYPES`), Task 2 (Drizzle `contractLineTypeEnum`) and Task 5
+  (`case 'per_device_group':` in `resolveLineQty` / `generateDueInvoice`) are
+  one compile unit: adding the value to `contractLineTypeEnum` in
+  `apps/api/src/db/schema/contracts.ts` widens
+  `typeof contractLines.$inferSelect['lineType']`, which breaks the
+  `const _exhaustive: never = line.lineType` guard in `contractService.ts` at
+  compile time. Task 4 is in the same wave for the same reason —
+  `CoverageLine.lineType` is typed `ContractLineType` and `isDeviceLine`
+  compares against `'per_device_group'`, both of which are type errors until
+  Task 1 lands, and `groupMembersForBilling` consumes wave A's
+  `GroupForResolution`. Splitting B ships either a non-compiling repo or a
+  placeholder arm that silently accepts a line type nothing can bill.
+  - **The riskiest change in the repo lives here:** Task 4 reshapes
+    `snapshotContractDevices` from grouped counts to one row per device, which
+    is live billing math for existing `per_device` and `per_device_role` lines.
+    Quantities and `uncoveredDevices` must be identical before and after —
+    `contractDeviceRoles.integration.test.ts`, `contractQuantities.integration.test.ts`
+    and the rewritten `contractCoverage.test.ts` are the proof. Review that task
+    on its own commit.
+- **C** adds a refusal that does not exist today. Without it,
+  `ON DELETE SET NULL (device_group_id)` still keeps the stamped
+  `device_group_name`, so a deleted group yields `unresolved: 'group_deleted'`
+  on reads and a `GROUP_DELETED` throw on generation — loud and recoverable,
+  never a silent zero, and never a wrong invoice. **Ship B and C in the same
+  release.** If that is not possible, merge C the same day: it is one new
+  service plus three call sites.
+- **D** is additive UI. Between B and D the line type is reachable only through
+  the API and the AI `manage_contracts` tool; the editor simply does not offer
+  it, and `lineTypes.ts` renders an unrecognised type by its raw key rather than
+  crashing.
+
+### Per-wave close-out
+
+Every wave ends with Task 12's close-out, scoped to that wave's files. PR bodies
+for waves A–C use `Refs #4648`, `Refs #4584`, `Refs #3205`; **wave D** (the last
+to merge) carries `Closes #4648`. If Todd wants per-wave tracking issues
+instead, run `add_wave` on feature #3205 before starting wave A and re-point
+each PR at its own sub-issue.
+
+Concrete `## What` bullets for each PR body:
+
+- **A** — Extracts the membership resolver out of `evaluateGroupMembership` so
+  one definition of "who is in this group" serves both materialization and (in
+  wave B) billing. Read-only; evaluates a dynamic group's filter live and unions
+  the pinned members. No behaviour change.
+- **B** — New `per_device_group` contract line type. Static groups bill their
+  current members; dynamic groups are evaluated **live** at estimate and invoice
+  time, so a stale materialized membership can never be invoiced (#4630 is the
+  product-wide staleness bug; billing does not depend on it). The device
+  snapshot is per-device now, so group, role and site compose exactly; overlap
+  still bills twice and covers once. A group that cannot be evaluated fails the
+  estimate and generation loudly (`GROUP_EVALUATION_FAILED`, full rollback);
+  the contracts list and MRR rollup degrade per contract instead of failing
+  whole.
+- **C** — Deleting a device group now goes through one transactional
+  `deleteDeviceGroup` on all three surfaces (two routes + AI `manage_groups`),
+  refused with 409 while a draft/active/paused contract bills it (contract names
+  disclosed only to `contracts:read`). Lines on ended contracts keep the stamped
+  group name after deletion.
+- **D** — Contract editor offers the group line type with a group picker; the
+  detail page and contracts list render group quantities and the unresolved
+  state; docs updated. Eight locales.
+
+---
+
+## Tenancy, RLS and registration lists
+
+**No new tables.** This wave adds two columns to `contract_lines`
+(`device_group_id`, `device_group_name`) and one unique index to
+`device_groups`. That changes which registration lists apply — read this
+section before writing the migration, and re-verify each claim with the grep
+given, because "RLS coverage does not imply cascade coverage" and this is the
+step that gets missed (CLAUDE.md; five prior incidents, caught 5/5 by the
+contract tests and 0/5 by code review).
+
+### RLS shape
+
+Both tables are **shape 1 — direct `org_id` column**, already `ENABLE` +
+`FORCE ROW LEVEL SECURITY` with four `breeze_has_org_access(org_id)` policies:
+
+- `contract_lines` — `apps/api/migrations/2026-06-15-d-recurring-contracts.sql:99-110`
+- `device_groups` — `apps/api/migrations/0001-baseline.sql` (policies at
+  `:15575`, `:16436`, `:17297`, `:18158`; `FORCE` at `:3179`)
+
+Shape 1 is **auto-discovered** by `rls-coverage.integration.test.ts` — there is
+**no allowlist to edit** (`ORG_ID_KEYED_TENANT_TABLES`,
+`PARTNER_TENANT_TABLES`, `DEVICE_ID_JOIN_POLICY_TABLES`,
+`USER_ID_SCOPED_TABLES`, `DUAL_AXIS_TENANT_TABLES` all stay untouched). The
+migration adds **no `CREATE POLICY`** — new columns inherit the table's
+existing policies. Verify:
+
+```bash
+grep -n 'contract_lines\|device_groups' apps/api/src/__tests__/integration/rls-coverage.integration.test.ts
+# expect only the shape-1 comment at :3571 and the existing WITH CHECK forge test
+```
+
+The new composite FK `(device_group_id, org_id) → device_groups(id, org_id)` is
+what makes RLS non-bypassable here: without the `org_id` leg, a caller could
+point a line at another org's group id and the row would still satisfy
+`breeze_has_org_access(org_id)` on `contract_lines`. Task 2's truth table
+proves the cross-org insert fails with `23503`
+(`contract_lines_device_group_org_fk`), as `breeze_app`, under forced RLS.
+
+`resolveEffectiveGroupMembers` (Task 3) runs in the **caller's** context. On
+the request path that is `withDbAccessContext`; in the contract worker it is
+`withSystemDbAccessContext`. Task 5's headline test asserts request-context and
+system-context parity so the worker can never see members a tech cannot. Never
+use the bare pool.
+
+### The four cascade/export registration lists
+
+| List | File | Change | Why |
+|---|---|---|---|
+| `CORE_ORG_CASCADE_DELETE_ORDER` | `services/tenantCascade.ts:190` | **none** | `contract_lines` already registered (`device_groups` at `:218`, `device_group_memberships` at `:217` — children before parents already holds). No new table. |
+| `CORE_DEVICE_CASCADE_DELETE_TABLES` | `routes/devices/core.ts` | **none** | `contract_lines` has no `device_id` column (`grep -n deviceId apps/api/src/db/schema/contracts.ts` → no match). A group line bills devices by membership, never by FK. |
+| `CORE_DEVICE_ORG_DENORMALIZED_TABLES` | `routes/devices/core.ts` | **none** | Same reason — no `device_id`, so the denormalized-`org_id` pairing does not apply. |
+| `AUDIT_ADMIN_REQUIRED_TABLES` | `services/tenantCascade.ts:674` | **none** | `contract_lines` is not append-only; it has no `REVOKE DELETE` and no immutability trigger. |
+| `CORE_TENANT_EXPORT_POLICY` | `services/tenantExportPolicyRegistry.ts:148` | **REQUIRED** | This is the one list a **column** addition fires. Every column of every org-cascade table must be classified. |
+| `orgMergeRegistry` (6th list) | `services/orgMergeRegistry.ts:486, 506` | **none** | Both tables are already `repoint`. A column addition needs no new policy — but see the deferrable-FK note below, which is what makes the repoint survive. |
+
+Export-policy bucket for the two new columns: **`included`**, alongside
+#4585's `device_roles`. `device_group_id` is a tenant identifier and
+`device_group_name` is a stamped label — neither matches
+`SUSPICIOUS_NAME_PARTS`, and critically **neither is `json`/`jsonb`/`bytea`**,
+so `excludedOpen` does not apply. `device_group_name` is deliberately
+`varchar(255)`, not a JSON blob, partly for this reason.
+
+Both export suites (`tenant-export-policy.integration.test.ts` and
+`tenantExportErasureRoundtrip.integration.test.ts`) need a live database, so
+**neither can fail in the Test API unit job**. A wave-B PR that forgets
+`tenantExportPolicyRegistry.ts` reads green until the `integration-test` job.
+Task 2 Step 6 and Task 8 are that step — do not defer either.
+
+### Partner-wide-first (epic #2135) — why it does not apply
+
+CLAUDE.md's partner-wide-first rule covers **config/policy tables** (policies,
+templates, rules, windows, baselines), which default to dual ownership
+(`org_id` XOR `partner_id`). Neither table this wave touches is one:
+
+- `contract_lines` is **transactional billing data**, a child of `contracts`.
+  A line bills one customer's devices at one price and appears on that
+  customer's invoice; it can never be "one policy applied to all orgs."
+  `contracts` itself already carries both `partner_id` and `org_id` for the MSP
+  axis, and `contract_lines` inherits its org through the composite
+  `(contract_id, org_id)` FK added in Task 2.
+- `device_groups` is pre-existing org-owned fleet structure. This wave adds
+  only a unique index to it and does not change its ownership.
+
+So: **no `partner_id` column, no `<table>_one_owner_chk`, no dual-axis policy,
+no `PARTNER_LINKABLE_FEATURE_TYPES` entry, no `canManagePartnerWidePolicies`
+gate, no `ownerScope` field.** A reviewer looking for the partner-wide
+checklist should find this paragraph and stop. If a future wave wants
+partner-wide *group templates* that fan out to every org, that is a new table
+and a new plan, not a column here.
+
+### Org-merge contract
+
+Org merge runs `SET CONSTRAINTS ALL DEFERRED` and re-points parent and child
+`org_id` in **separate statements**. Both composite FKs added in Task 2
+(`contract_lines_device_group_org_fk`, `contract_lines_contract_org_fk`)
+therefore **must** be `DEFERRABLE INITIALLY IMMEDIATE` — a non-deferrable one
+aborts the merge with `23503`. This is enforced by
+`orgLifecycleFoundations.integration.test.ts` ("merge contract"), which runs
+**only under Integration Tests (shard 2)**: a unit-green PR still goes red
+there, exactly as #4585 did. Task 2 Step 7 runs that suite locally; do not skip
+it.
+
+---
+
+## CI traps and how this plan avoids them
+
+1. **Stacked PRs get no CI.** `ci.yml` is `pull_request: branches: [main]`. A
+   wave branched off another wave runs zero jobs and `gh pr checks` reads green.
+   This plan branches every wave off `main` and merges in order. If you must
+   stack anyway, dispatch per branch before merging:
+   `gh workflow run CI --ref <branch>`.
+2. **`pnpm test` does not run the contract suites.** The RLS and integration
+   suites use separate configs (`vitest.config.rls.ts`,
+   `vitest.integration.config.ts`) and are invisible to `pnpm test`. Local green
+   ≠ CI green. Every wave that touches tenancy, cascade, export or migrations
+   must run them explicitly (Task 12 Step 2 lists the exact per-wave command).
+3. **The integration job blocks PRs.** `integration-test` (4 shards) carries no
+   `continue-on-error` and `ci-success` hard-fails on its result — do **not**
+   hand-dispatch CI to "get an integration run" on a PR that targets `main`; it
+   already ran. The `continue-on-error` on pull requests belongs to the separate
+   non-blocking `smoke-test` job.
+4. **CI tests the merge commit, not your branch head.** A wave can be green
+   locally and red on the PR because `main` moved. Run `gh pr update-branch`
+   after any main movement rather than `gh run rerun --failed`, which reuses the
+   stale merge commit.
+5. **Targeted vitest runs silently miss siblings.** The path filter is a plain
+   substring match, not a glob: `npx vitest run src/routes/groups/` skips
+   `src/routes/groups.ts`'s own `groups_update_delete.test.ts`. List dotted
+   siblings explicitly and check the reported file count. Never write
+   `pnpm --filter <pkg> test -- --run <path>` — the `--` makes vitest run the
+   whole suite in watch mode.
+6. **Migration filename floor moves.** Re-run
+   `ls apps/api/migrations | grep -E '^[0-9]{4}-' | sort | tail -1` immediately
+   before creating wave B's two migration files. The pre-push hook re-checks against
+   `origin/main`, so a name that passed at commit time can fail at push time if
+   `main` gained a later-sorting migration meanwhile. As of writing the floor is
+   `2026-10-05-100200-patch-reboot-deferral-settings.sql`, so
+   `2026-10-06-100000-…` / `2026-10-06-100100-…` still sort last.
 
 ---
 
 ## File map
+
+Every task heading carries its wave (`> **Wave B.**`); the [Waves](#waves)
+table maps waves to tasks. A file listed once here may be touched by two
+waves — Task 10 in particular splits across D and E.
 
 | File | Change |
 |---|---|
@@ -59,6 +318,8 @@ tracking_issue: LanternOps/breeze#3205
 ---
 
 ### Task 1: Shared validators — `per_device_group` and `deviceGroupId`
+
+> **Wave B.**
 
 **Files:**
 - Modify: `packages/shared/src/validators/contracts.ts:9-48`
@@ -138,7 +399,7 @@ The existing `siteId` refine (`per_device | per_device_role` only) and the two-w
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `cd packages/shared && npx vitest run src/validators/contracts.test.ts`
-Expected: PASS, including the wave 1 `per_device_role` describe.
+Expected: PASS, including the #4585 `per_device_role` describe.
 
 - [ ] **Step 5: Typecheck downstream and commit**
 
@@ -153,6 +414,8 @@ git commit -m "feat(shared): per_device_group contract line type + deviceGroupId
 ---
 
 ### Task 2: Migrations, Drizzle schema, export policy, constraint truth table
+
+> **Wave B.**
 
 **Files:**
 - Create: `apps/api/migrations/2026-10-06-100000-contract-line-type-per-device-group.sql`
@@ -447,6 +710,8 @@ git commit -m "feat(billing): contract_lines device group columns, CHECK, deferr
 
 ### Task 3: Membership resolution — `resolveEffectiveGroupMembers`
 
+> **Wave A.**
+
 **Files:**
 - Modify: `apps/api/src/services/groupMembership.ts` (imports lines 1-6; `evaluateGroupMembership` lines 243-364)
 - Create: `apps/api/src/__tests__/integration/groupMembership.resolve.integration.test.ts`
@@ -693,6 +958,8 @@ git commit -m "feat(groups): resolveEffectiveGroupMembers — one read-only memb
 ---
 
 ### Task 4: Counting — per-device snapshot, group members, pure helpers
+
+> **Wave B.**
 
 **Files:**
 - Modify: `apps/api/src/services/contractQuantities.ts:46-63`
@@ -1008,6 +1275,8 @@ git commit -m "feat(billing): per-device snapshot + group membership in coverage
 
 ### Task 5: Service — group resolution, quantities, estimate, generation, list/MRR isolation, writers, line mapper
 
+> **Wave B.**
+
 **Files:**
 - Modify: `apps/api/src/services/contractTypes.ts:32-50` (error codes) and the `ContractEstimate` line type in the same file (grep `lines: Array<{ lineId`)
 - Modify: `apps/api/src/services/contractService.ts` — imports (`:1-37`), cache + `resolveLineQty` (`:185-250`), `getContract` (`:135-142`), `listContracts` (`:144-184`), `computeContractEstimate` (`:263-281`), MRR (`:358-450`), `addContractLineToContract` (`:866-913`), `generateDueInvoice` (`:1055-1189`), `createContractWithLinesDetailed` (`:1205-1271`)
@@ -1200,7 +1469,7 @@ In the `ContractEstimate` interface, the `lines` element gains `unresolved?: 'gr
 
 - [ ] **Step 4: Cache, group loading, `resolveLineQty`**
 
-In `contractService.ts` imports: add `deviceGroups` to the `'../db/schema'` import; replace the two wave 1 imports with
+In `contractService.ts` imports: add `deviceGroups` to the `'../db/schema'` import; replace the two #4585 imports with
 
 ```ts
 import { countContractSeats, snapshotContractDevices, groupMembersForBilling, type DeviceSnapshotRow } from './contractQuantities';
@@ -1442,7 +1711,7 @@ describe('per_device_group quantities (#3205 W02)', () => {
 });
 ```
 
-Write each body against the mocks the file already uses (`vi.mock('../db', …)` with chained `select().from().where()` resolvers) — copy the closest existing wave 1 test (`resolveLineQty role path reads the snapshot once per org`) and vary the fixtures.
+Write each body against the mocks the file already uses (`vi.mock('../db', …)` with chained `select().from().where()` resolvers) — copy the closest existing #4585 test (`resolveLineQty role path reads the snapshot once per org`) and vary the fixtures.
 
 - [ ] **Step 9: Run everything touched**
 
@@ -1464,6 +1733,8 @@ git commit -m "feat(billing): per_device_group quantities — live group evaluat
 ---
 
 ### Task 6: Group deletion — one service, three surfaces
+
+> **Wave C.**
 
 **Files:**
 - Create: `apps/api/src/services/deviceGroupDelete.ts`
@@ -1756,6 +2027,8 @@ git commit -m "feat(groups): one transactional deleteDeviceGroup for all three s
 
 ### Task 7: Quote-to-contract spec, AI `manage_contracts` description, worker isolation test
 
+> **Wave B.**
+
 **Files:**
 - Modify: `apps/api/src/services/quoteToContract.ts:29-42`
 - Modify: `apps/api/src/services/aiToolsContracts.ts:281-294` (the `line` description)
@@ -1763,7 +2036,7 @@ git commit -m "feat(groups): one transactional deleteDeviceGroup for all three s
 
 - [ ] **Step 1: Failing tests**
 
-`aiToolsContracts.manageContracts.test.ts` — beside the wave 1 role cases:
+`aiToolsContracts.manageContracts.test.ts` — beside the #4585 role cases:
 
 ```ts
 it('add_line accepts a per_device_group line and rejects one without deviceGroupId', async () => {
@@ -1850,12 +2123,14 @@ git commit -m "feat(billing): per_device_group in quote→contract spec and AI m
 
 ### Task 8: Tenant export and erasure round-trip
 
+> **Wave B.**
+
 **Files:**
 - Modify: `apps/api/src/__tests__/integration/tenantExportErasureRoundtrip.integration.test.ts:113-142` and its assertions on `contract_lines.json`
 
 - [ ] **Step 1: Extend the seed (failing until the columns are asserted)**
 
-After the wave 1 `per_device_role` line insert:
+After the #4585 `per_device_role` line insert:
 
 ```ts
   // #3205 W02: a per_device_group line, so contract_lines.json carries
@@ -1888,6 +2163,8 @@ git commit -m "test(billing): export/erasure round-trip covers a per_device_grou
 ---
 
 ### Task 9: Web — API types, line-type module, editor group select, i18n
+
+> **Wave D.**
 
 **Files:**
 - Modify: `apps/web/src/lib/api/contracts.ts:52, 63-84`
@@ -2055,7 +2332,7 @@ Same keys in the other seven locales:
 - [ ] **Step 7: Run**
 
 Run: `cd apps/web && npx vitest run src/components/contracts/ContractEditor src/lib/i18n && npx tsc --noEmit -p tsconfig.json 2>&1 | head`
-Expected: PASS (including the wave 1 `roles` and `autosave` editor suites and the `tr-TR` parity test); tsc clean.
+Expected: PASS (including the #4585 `roles` and `autosave` editor suites and the `tr-TR` parity test); tsc clean.
 
 - [ ] **Step 8: Commit**
 
@@ -2067,6 +2344,8 @@ git commit -m "feat(web): per_device_group line type — group select, sub-label
 ---
 
 ### Task 10: Web — detail page, contracts list, Device Groups delete modal
+
+> **Wave C + D (split).** The `DeviceGroupsPage.tsx` delete-modal steps belong to wave C (they are the UI for Task 6's 409); the `ContractDetail.tsx` / `ContractsList.tsx` steps belong to wave D. Do each half in its own wave's PR — never carry one across.
 
 **Files:**
 - Modify: `apps/web/src/components/contracts/ContractDetail.tsx:374-391` and its estimate/generate rendering
@@ -2132,6 +2411,8 @@ git commit -m "feat(web): group line labels on detail, list estimate fallback, 4
 
 ### Task 11: Docs
 
+> **Wave D.**
+
 **Files:**
 - Modify: `apps/docs/src/content/docs/features/contracts.mdx:33-45`
 
@@ -2163,72 +2444,141 @@ git commit -m "docs(contracts): per device group lines (#3205 W02)"
 
 ---
 
-### Task 12: Full verification and pull request
+### Task 12: Per-wave close-out and pull request
+
+> **Every wave (A–D).** Run this at the end of each wave, scoped to that wave's
+> files. The last wave to merge additionally runs the full sweep in Step 3.
 
 **Files:** none new.
 
-- [ ] **Step 1: Full local verification on a fresh test stack**
+- [ ] **Step 1: Typecheck, lint and unit tests for the packages this wave touched**
 
 ```bash
-cd apps/api && npx tsc --noEmit -p tsconfig.json && cd ../web && npx tsc --noEmit -p tsconfig.json && cd ../../packages/shared && npx tsc --noEmit -p tsconfig.json
-pnpm lint
-pnpm --filter @breeze/shared test --run
-pnpm --filter @breeze/api test --run
-pnpm --filter @breeze/web test --run
-# fresh DB
-export DATABASE_URL=<test stack url> && cd apps/api && pnpm db:migrate && pnpm db:check-drift
+# always, for any wave that touched apps/api or packages/shared
+cd apps/api && npx tsc --noEmit -p tsconfig.json
+cd ../../packages/shared && npx tsc --noEmit -p tsconfig.json
+# waves C and D only
+cd ../../apps/web && npx tsc --noEmit -p tsconfig.json
+cd ../.. && pnpm lint
+pnpm --filter @breeze/shared test --run     # wave B
+pnpm --filter @breeze/api test --run        # waves A, B, C
+pnpm --filter @breeze/web test --run        # waves C, D
+```
+Expected: green. `pnpm lint` before the PR, always — an `eslint-disable` for an
+unregistered rule *is itself* the lint error.
+
+- [ ] **Step 2: The contract suites `pnpm test` does not run**
+
+`pnpm test` sees neither `vitest.config.rls.ts` nor
+`vitest.integration.config.ts`. Local unit-green is not CI-green. Bring up a
+test stack (`worktree-stack` skill, or `docker compose -f docker-compose.test.yml up -d`),
+`export DATABASE_URL=<test stack url>`, then run the wave's slice:
+
+```bash
+cd apps/api
+# Wave A
+npx vitest run --config vitest.integration.config.ts \
+  src/__tests__/integration/groupMembership.resolve.integration.test.ts \
+  src/__tests__/integration/dynamicGroupMembershipMaterialization.integration.test.ts \
+  src/__tests__/integration/groupDeleteMembershipLog.integration.test.ts
+# Wave B  (migrations moved: run db:migrate + db:check-drift on a FRESH db first)
+pnpm db:migrate && pnpm db:check-drift
+npx vitest run src/db/autoMigrate.test.ts
 npx vitest run --config vitest.integration.config.ts \
   src/__tests__/integration/contractLinesDeviceGroupConstraints.integration.test.ts \
-  src/__tests__/integration/groupMembership.resolve.integration.test.ts \
   src/__tests__/integration/contractDeviceGroups.integration.test.ts \
-  src/__tests__/integration/deviceGroupDelete.integration.test.ts \
+  src/__tests__/integration/contractQuantities.integration.test.ts \
   src/__tests__/integration/contractService.integration.test.ts \
   src/__tests__/integration/contractDeviceRoles.integration.test.ts \
-  src/__tests__/integration/contractQuantities.integration.test.ts \
-  src/__tests__/integration/dynamicGroupMembershipMaterialization.integration.test.ts \
-  src/__tests__/integration/groupDeleteMembershipLog.integration.test.ts \
   src/__tests__/integration/orgLifecycleFoundations.integration.test.ts \
+  src/__tests__/integration/tenantCascade.integration.test.ts \
   src/__tests__/integration/tenant-export-policy.integration.test.ts \
   src/__tests__/integration/tenantExportErasureRoundtrip.integration.test.ts \
-  src/__tests__/integration/tenantCascade.integration.test.ts
+  src/__tests__/integration/rls-coverage.integration.test.ts
 npx vitest run --config vitest.config.rls.ts
+# Wave C
+npx vitest run --config vitest.integration.config.ts \
+  src/__tests__/integration/deviceGroupDelete.integration.test.ts \
+  src/__tests__/integration/contractDeviceGroups.integration.test.ts \
+  src/__tests__/integration/groupDeleteMembershipLog.integration.test.ts
+# Wave D — web only; no integration suites. Run the web unit tests in Step 1.
 ```
-Expected: all green. Then the manual checks from the spec's Testing section (psql CHECK probes as `breeze_app`; group delete through the UI against an active and a cancelled contract).
 
-- [ ] **Step 2: Tear down the test stack, push, open the PR**
+Wave B's list is not optional. `tenant-export-policy`,
+`tenantExportErasureRoundtrip`, `tenantCascade` and `orgLifecycleFoundations`
+all need a live database, so **none of them can fail in the Test API unit
+job** — a wave-B PR that forgot `tenantExportPolicyRegistry.ts` or wrote a
+non-deferrable composite FK reads green locally and on `test-api`, then reds
+`integration-test` shard 2 (exactly how #4585 went red).
+
+Tear the test stack down when the wave is done
+(`docker compose -f docker-compose.test.yml down -v`; `docker compose ls -a` is
+the only view that shows every stack).
+
+- [ ] **Step 3: Last wave only — full sweep**
+
+Run every command in Steps 1 and 2 across all waves' suites on a fresh database,
+plus the manual checks from the spec's Testing section: psql CHECK probes as
+`breeze_app` (`docker exec -it breeze-postgres psql -U breeze_app -d breeze`,
+forge a cross-org group line — must fail with `23503`), and a group delete
+through the UI against both an active and a cancelled contract.
+
+- [ ] **Step 4: Push and open the wave's PR**
+
+Branch names, dependencies and `Closes`/`Refs` per the [Waves](#waves) table.
+**Base every PR on `main`.** Never `--base` a sibling wave branch: `ci.yml`
+triggers on `pull_request: branches: [main]`, so a stacked PR runs no CI and
+`gh pr checks` reads green on untested code. If a wave must stack anyway,
+dispatch CI per branch before merging: `gh workflow run CI --ref <branch>`.
 
 ```bash
-git push -u origin feature/3205-device-groups/wave-4648
-gh pr create --repo LanternOps/breeze --base main --title "feat(billing): contract lines billed by device group (#3205 W02)" --body "$(cat <<'EOF'
-Closes #4648
+git push -u origin feature/3205-device-groups/wave-<a|b|c|d>-<slug>
+gh pr create --repo LanternOps/breeze --base main \
+  --title "feat(billing): <wave title> (#3205 W02, wave <A|B|C|D>)" \
+  --body "<template below; the What bullets are written out per wave in the Waves section>"
+gh pr checks <pr> --watch      # integration-test (4 shards) must be green — it BLOCKS
+```
+
+If `main` moves while the PR is open, run `gh pr update-branch <pr>` — CI tests
+the **merge commit**, not your branch head, and `gh run rerun --failed` reuses
+the stale merge commit.
+
+PR body template (adjust the What/Migrations/Tests bullets per wave; only wave D
+carries `Closes`):
+
+```
+Refs #4648
 Refs #4584
 Refs #3205
 
 Spec: `docs/superpowers/specs/billing/2026-09-02-contract-lines-per-device-group-design.md`
-Plan: `docs/superpowers/plans/billing/2026-09-02-contract-lines-per-device-group.md`
+Plan: `docs/superpowers/plans/billing/2026-09-02-contract-lines-per-device-group.md` (wave <A|B|C|D>)
 
 ## What
 
-- New `per_device_group` contract line type. Static groups bill their current members; dynamic groups are evaluated LIVE at estimate and invoice time through a new read-only `resolveEffectiveGroupMembers` that the group evaluator also uses (one definition of membership). A stale materialized membership can never be invoiced (#4630 is the product-wide staleness bug; billing does not depend on it).
-- The wave 1 device snapshot is per-device now, so group, role and site compose exactly in the pure coverage helpers; overlap still bills twice and covers once.
-- A group that cannot be evaluated fails the estimate and generation loudly (`GROUP_EVALUATION_FAILED`, full rollback); the contracts list and MRR rollup degrade per contract instead of failing whole.
-- Deleting a group goes through one transactional `deleteDeviceGroup` on all three surfaces (two routes + AI `manage_groups`); refused with 409 while a draft/active/paused contract bills it (contract names only for `contracts:read`). Lines on ended contracts keep the stamped group name after deletion.
-- Tenancy: unique `device_groups(id, org_id)`, composite `(device_group_id, org_id)` and `(contract_id, org_id)` FKs, both `DEFERRABLE INITIALLY IMMEDIATE` for org merge; a group line carries no `site_id` (Zod + CHECK).
+<copy this wave's bullets verbatim from the Waves section of the plan>
+
+## Tenancy
+
+No new tables. `contract_lines` and `device_groups` are both shape 1 (direct
+`org_id`, ENABLE + FORCE RLS, `breeze_has_org_access(org_id)`), so
+`rls-coverage.integration.test.ts` auto-discovers them and no allowlist changes.
+Already registered in `CORE_ORG_CASCADE_DELETE_ORDER` and `orgMergeRegistry`;
+no `device_id` column, so neither device cascade list applies; not append-only,
+so not `AUDIT_ADMIN_REQUIRED_TABLES`. <wave B only:> `device_group_id` and
+`device_group_name` added to `CORE_TENANT_EXPORT_POLICY` (`included`). Both new
+composite FKs are `DEFERRABLE INITIALLY IMMEDIATE` for org merge.
 
 ## Migrations
 
-- `2026-10-06-100000-contract-line-type-per-device-group.sql` — enum value only.
-- `2026-10-06-100100-contract-lines-device-group.sql` — unique index, two columns, CHECK, two deferrable composite FKs, partial index, contract/org preflight (raises on a pre-existing mismatch).
+<wave B only — the two migration files; "none" for every other wave>
 
 ## Tests
 
-Shared validator; CHECK/FK/deferrable truth table; resolver (static, dynamic ∪ pinned, NULL filter, malformed filter, site-bound, forged-org row); the headline stale-membership test with request-vs-system parity; ephemeral/decommissioned/off-site members; failure rollback + list degradation; deleted-group handling; delete service by contract status + children; route/AI 409 mapping with permission-gated disclosure; worker isolation; export/erasure round-trip; web editor/detail/list/delete-modal; locale parity.
+<the suites this wave adds or changes, unit and integration — listed per wave in Task 12 Step 2>
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-https://claude.ai/code/session_01AXFWi7tAV9LWM2UCNMPrpZ
-EOF
-)"
 ```
 
-Stop here. Do not merge. Report the PR URL and anything that was skipped or failed.
+Stop at the open PR. Do not merge. Report the PR URL and anything skipped or
+failed.
