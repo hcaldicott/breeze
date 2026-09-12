@@ -20,6 +20,8 @@
     "oneDrive": "OneDrive",
     "aiForOffice": "AI per Office",
     "networkMonitor": "Monitoraggio rete",
+    "jobs": "Attività",
+    "monitoring": "Monitoraggio",
     "networkDiscovery": "Rilevamento rete",
     "edr": "EDR",
     "dnsSecurity": "Sicurezza DNS",
@@ -82,6 +84,11 @@
     "deviceBackup": "Backup dispositivi",
     "sectionServiceDesk": "Service desk",
     "serviceManagement": "Gestione servizi"
+  },
+  "monitoringTabs": {
+    "ariaLabel": "Sezioni di monitoraggio",
+    "network": "Rete",
+    "delivery": "Consegna"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
